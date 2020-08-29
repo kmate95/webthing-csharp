@@ -1,23 +1,86 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
 trigger:
+  branches:
+    include:
+      - master
+      - release-*
+      - Release-*
+      - refs/tags/v*
+pr:
 - master
+- release-*
 
-pool:
-  vmImage: 'ubuntu-latest'
-
-steps:
-- task: DotNetCoreInstaller@0
-  inputs:
-    version: '3.0.100-preview6-012264'
-
-- script: dotnet restore
-  displayName: 'Restore application'
-
-- script: dotnet build
-  displayName: 'Build application'
-
-- script: dotnet test
-  displayName: 'Testing application'
+stages:
+  - stage: ubuntu_latest
+    displayName: 'ubuntu-latest'
+    dependsOn: [  ]
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - job: Compile
+        displayName: 'Compile'
+        dependsOn: [  ]
+        steps:
+          - task: CmdLine@2
+            inputs:
+              script: './build.sh Restore Compile --skip'
+      - job: Test
+        displayName: 'Test'
+        dependsOn: [ Compile ]
+        strategy:
+          parallel: 2
+        steps:
+          - task: CmdLine@2
+            inputs:
+              script: './build.sh Test --skip --test-partition $(System.JobPositionInPhase)'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              artifactName: test-results
+              pathtoPublish: 'artifacts/test-results'
+      - job: Coverage
+        displayName: 'Coverage'
+        dependsOn: [ Test ]
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: test-results
+              path: 'artifacts/test-results'
+          - task: CmdLine@2
+            inputs:
+              script: './build.sh Coverage --skip'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              artifactName: coverage-report
+              pathtoPublish: 'artifacts/coverage-report.zip'
+      - job: AcceptanceTest
+        displayName: 'Acceptance Test'
+        dependsOn: [ Test ]
+        steps:
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.7'
+            inputs:
+              versionSpec: '3.7'
+          - script: './build.sh AcceptanceTest --skip'
+            displayName: 'Execute Acceptance Test'
+      - job: Pack
+        displayName: 'Pack' 
+        dependsOn: [ Compile, Test, AcceptanceTest ]
+        steps:
+          - task: CmdLine@2
+            inputs:
+              script: './build.sh Pack --skip'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              artifactName: packages
+              pathtoPublish: 'artifacts/packages'
+      - job: Publish
+        displayName: 'Publish'
+        condition: startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+        dependsOn: [ Pack ]
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: packages
+              path: 'artifacts/packages'
+          - task: CmdLine@2
+            inputs:
+              script: './build.sh Publish --api-key $(NUGET_TOKEN) --skip'

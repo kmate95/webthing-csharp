@@ -1,53 +1,122 @@
-using System.Diagnostics.CodeAnalysis;
-using System.IO;
+using System;
+using System.Buffers;
 using System.Net;
-using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
+using Microsoft.Net.Http.Headers;
+using Mozilla.IoT.WebThing;
+using Mozilla.IoT.WebThing.Json;
 
 namespace Microsoft.AspNetCore.Http
 {
-    [ExcludeFromCodeCoverage]
     internal static class HttpContextExtensions
     {
-        public static async Task<T> ReadBodyAsync<T>(this HttpContext context)
+        public static T GetRouteData<T>(this HttpContext request, string key)
         {
-            using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+            if (request == null)
             {
-                return JsonConvert.DeserializeObject<T>(await reader.ReadToEndAsync()
-                    .ConfigureAwait(false));
-            }
-        }
-        
-        
-        public static async Task WriteBodyAsync<T>(this HttpContext context, HttpStatusCode statusCode, T value)
-        {
-            JsonSerializerSettings settings = context.RequestServices.GetService<JsonSerializerSettings>();
-            
-            string json =  value switch
-            {
-                JToken token => token.ToString(settings.Formatting),
-                _ => JsonConvert.SerializeObject(value, settings) 
-            };
-            
-            context.Response.StatusCode = (int) statusCode;
-            context.Response.ContentType = "application/json";
-            
-            await context.Response.WriteAsync(json)
-                .ConfigureAwait(false);
-        }
-
-        public static T GetValueFromRoute<T>(this HttpContext context, string key)
-        {
-            if (context.GetRouteData().Values.TryGetValue(key, out object value))
-            {
-                return (T)value;
+                throw new ArgumentNullException(nameof(request));
             }
 
-            return default;
+            if (key == null)
+            {
+                throw new ArgumentNullException(nameof(key));
+            }
+
+            var routeData = request.GetRouteData();
+
+            if (routeData.Values.TryGetValue(key, out var result))
+            {
+                return (T)result;
+            }
+            
+            throw new Exception();
+        }
+
+        public static async Task<T> FromBodyAsync<T>(this HttpContext context, JsonSerializerOptions options,
+            CancellationToken cancellationToken = default)
+        {
+            var reader = context.Request.BodyReader;
+            T result = default!;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                var buffer = readResult.Buffer;
+                var position = buffer.PositionOf((byte)'}');
+                if (position != null)
+                {
+                    if (buffer.IsSingleSegment)
+                    {
+                        result = JsonSerializer.Deserialize<T>(buffer.FirstSpan, options);
+                    }
+                    else
+                    {
+                        throw new NotImplementedException();
+                    }
+                }
+
+                reader.AdvanceTo(buffer.Start, buffer.End);
+
+                if (readResult.IsCompleted) break;
+            }
+
+            return result;
+        }
+
+        public static async Task WriteBodyAsync<T>(this HttpContext context, 
+            HttpStatusCode statusCode, T value)
+        {
+            context.Response.StatusCode = (int)statusCode;
+            context.Response.ContentType = Const.ContentType;
+            context.Response.Headers[HeaderNames.CacheControl] = "no-cache";
+
+            var cancellationToken = context.RequestAborted;
+            var convert = context.RequestServices.GetRequiredService<IJsonConvert>();
+
+            if (value != null)
+            {
+                var buffer = convert.Serialize(value);
+
+                await context.Response.BodyWriter.WriteAsync(buffer, cancellationToken)
+                    .ConfigureAwait(false);
+
+                await context.Response.BodyWriter.FlushAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        public static async Task<byte[]> GetBody(this HttpContext context)
+        {
+            var cancellationToken = context.RequestAborted;
+            var reader = context.Request.BodyReader;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                var buffer = readResult.Buffer;
+                var position = buffer.PositionOf((byte)'}');
+                if (position != null)
+                {
+                    if (buffer.IsSingleSegment)
+                    {
+                        return buffer.FirstSpan.ToArray();
+                    }
+
+                    throw new NotImplementedException();
+                }
+
+                reader.AdvanceTo(buffer.Start, buffer.End);
+
+                if (readResult.IsCompleted) break;
+            }
+
+            return Array.Empty<byte>();
         }
     }
 }
